@@ -10,6 +10,9 @@ use std::process::Command as Shell;
 const AUR_RPC: &str = "https://aur.archlinux.org/rpc/?v=5&";
 const GITHUB_AUR_MIRROR_RAW_BASE: &str = "https://raw.githubusercontent.com/archlinux/aur";
 
+const YES_OPTIONS: [&'static str; 4] = ["y", "yes", "true", "yeah"];
+const NO_OPTIONS: [&'static str; 4] = ["n", "not", "no", "nope"];
+
 #[derive(Deserialize)]
 struct RpcResponse {
     results: Vec<AurPkg>,
@@ -43,7 +46,14 @@ fn prompt_yes(question: &str) -> bool {
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
     let resp = input.trim().to_lowercase();
-    resp.is_empty() || resp == "y" || resp == "yes"
+
+    if YES_OPTIONS.contains(&resp.as_str()) {
+        return true;
+    } else if NO_OPTIONS.contains(&resp.as_str()) {
+        return false;
+    } else {
+        return prompt_yes(question);
+    }
 }
 
 // --- AUR RPC helpers ---
