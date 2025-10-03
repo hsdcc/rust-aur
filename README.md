@@ -20,7 +20,13 @@ As of now, 7 commands are available:
 | `uninstall` | `r`   | Uninstalls an installed AUR package    |
 | `help`      |       | Provides help on how to use this tool  |
 
-The only available flag is `--github` which uses the github mirror for package installation.
+3 flags are also available:
+
+| Flag            | Description                                         |
+| --------------- | --------------------------------------------------- |
+| `--github`      | Use the GitHub AUR mirror for package installation. |
+| `--meow`        | Meows at you (requires paid subscription /j)        |
+| `--bypass-sudo` | Allows the program to run with sudo privileges.     |
 
 ## Building
 

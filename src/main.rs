@@ -5,7 +5,10 @@ use serde::Deserialize;
 use std::error::Error;
 use std::fs;
 use std::io::{ self, Write };
-use std::process::Command as Shell;
+use std::process::{ exit, Command as Shell };
+extern crate nix;
+
+use nix::unistd::Uid;
 
 const AUR_RPC: &str = "https://aur.archlinux.org/rpc/?v=5&";
 const GITHUB_AUR_MIRROR_RAW_BASE: &str = "https://raw.githubusercontent.com/archlinux/aur";
@@ -330,7 +333,9 @@ fn cmd_install(pkgs: &[String], use_github: bool) -> Result<(), Box<dyn Error>> 
 }
 
 // --- Update logic: compare installed version to PKGBUILD version (GitHub) or AUR RPC (normal)
-fn cmd_update(use_github: bool) -> Result<(), Box<dyn Error>> {
+fn cmd_update(use_github: bool, bypass: &bool) -> Result<(), Box<dyn Error>> {
+    check_root(bypass);
+
     println!("Checking for updates...");
 
     let installed = get_installed_aur()?;
@@ -471,7 +476,9 @@ fn cmd_clean() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn cmd_uninstall(pkgs: &[String]) -> Result<(), Box<dyn Error>> {
+fn cmd_uninstall(pkgs: &[String], bypass: &bool) -> Result<(), Box<dyn Error>> {
+    check_root(&bypass);
+
     for pkg in pkgs {
         if !prompt_yes(&format!("Really uninstall {}?", pkg)) {
             println!("Skipping {}", pkg);
@@ -485,6 +492,16 @@ fn cmd_uninstall(pkgs: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+fn check_root(bypass: &bool) {
+    // Check is user is root         Check if a bypass flag was provided
+    if Uid::effective().is_root() && !*bypass {
+        println!(
+            "Running this program with root privileges is not supported. Use --bypass-sudo to use bypass this."
+        );
+        exit(1);
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -502,6 +519,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             Arg::new("meow")
                 .long("meow")
                 .help("meow (necessary feature)")
+                .global(true)
+                .action(ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("bypass-sudo")
+                .long("bypass-sudo")
+                .help("Bypass root verification (not recommended)")
                 .global(true)
                 .action(ArgAction::SetTrue)
         )
@@ -553,10 +577,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
+    let bypass = matches.get_flag("bypass-sudo");
+
     match matches.subcommand() {
         Some(("search", sub_m)) =>
             cmd_search(sub_m.get_one::<String>("query").unwrap(), use_github)?,
         Some(("install", sub_m)) => {
+            check_root(&bypass);
+
             let packages: Vec<String> = sub_m
                 .get_many::<String>("packages")
                 .unwrap()
@@ -564,7 +592,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .collect();
             cmd_install(&packages, use_github)?;
         }
-        Some(("update", _)) => cmd_update(use_github)?,
+        Some(("update", _)) => cmd_update(use_github, &bypass)?,
         Some(("info", sub_m)) => cmd_info(sub_m.get_one::<String>("package").unwrap(), use_github)?,
         Some(("clean", _)) => cmd_clean()?,
         Some(("uninstall", sub_m)) => {
@@ -573,7 +601,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap()
                 .cloned()
                 .collect();
-            cmd_uninstall(&packages)?;
+            cmd_uninstall(&packages, &bypass)?;
         }
         _ => unreachable!(),
     }
