@@ -1,226 +1,25 @@
-// main.rs - Simple AUR Helper
-use clap::{ Arg, ArgAction, Command };
-use reqwest::blocking::get;
-use serde::Deserialize;
+mod aur_rpc;
+mod cli;
+mod fetching;
+mod github;
+mod helpers;
+
+use aur_rpc::{fetch_info, fetch_search};
+use fetching::{get_installed_aur, is_debug_package};
+use github::{
+    fetch_github_packages, fetch_pkgbuild_from_github, github_package_exists,
+    parse_pkgbuild_version,
+};
+use helpers::{check_root, prompt_yes};
 use std::error::Error;
 use std::fs;
-use std::io::{ self, Write };
-use std::process::{ exit, Command as Shell };
-extern crate nix;
-
-use nix::unistd::Uid;
-
-const AUR_RPC: &str = "https://aur.archlinux.org/rpc/?v=5&";
-const GITHUB_AUR_MIRROR_RAW_BASE: &str = "https://raw.githubusercontent.com/archlinux/aur";
-
-const YES_OPTIONS: [&'static str; 4] = ["y", "yes", "true", "yeah"];
-const NO_OPTIONS: [&'static str; 4] = ["n", "not", "no", "nope"];
-
-#[derive(Deserialize)]
-struct RpcResponse {
-    results: Vec<AurPkg>,
-}
-
-#[derive(Deserialize, Clone)]
-struct AurPkg {
-    #[serde(rename = "Name")]
-    name: String,
-    #[serde(rename = "Version")]
-    version: Option<String>,
-    #[serde(rename = "Description")]
-    description: Option<String>,
-    #[serde(rename = "Popularity")]
-    popularity: Option<f32>,
-    #[serde(rename = "Maintainer")]
-    maintainer: Option<String>,
-    #[serde(rename = "Depends")]
-    #[serde(default)]
-    depends: Vec<String>,
-    #[serde(rename = "MakeDepends")]
-    #[serde(default)]
-    make_depends: Vec<String>,
-}
-
-// simple yes/no prompt
-fn prompt_yes(question: &str) -> bool {
-    print!("{} [Y/n] ", question);
-    io::stdout().flush().unwrap();
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
-    let resp = input.trim().to_lowercase();
-
-    if YES_OPTIONS.contains(&resp.as_str()) {
-        return true;
-    } else if NO_OPTIONS.contains(&resp.as_str()) {
-        return false;
-    } else {
-        return prompt_yes(question);
-    }
-}
-
-// --- AUR RPC helpers ---
-fn fetch_search(term: &str) -> Result<Vec<AurPkg>, Box<dyn Error>> {
-    let url = format!("{}type=search&arg={}", AUR_RPC, term);
-    let resp: RpcResponse = get(&url)?.json()?;
-    let mut packages = resp.results;
-    packages.sort_by(|a, b| {
-        b.popularity.unwrap_or(0.0).partial_cmp(&a.popularity.unwrap_or(0.0)).unwrap()
-    });
-    Ok(packages)
-}
-
-fn fetch_info(name: &str) -> Result<AurPkg, Box<dyn Error>> {
-    let url = format!("{}type=info&arg={}", AUR_RPC, name);
-    let resp: RpcResponse = get(&url)?.json()?;
-    resp.results
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("Package '{}' not found", name).into())
-}
-
-// --- GitHub PKGBUILD helpers ---
-// Fetch PKGBUILD from the GitHub aur mirror branch for package `pkg`
-// (raw URL: https://raw.githubusercontent.com/archlinux/aur/<branch>/PKGBUILD)
-fn fetch_pkgbuild_from_github(pkg: &str) -> Result<Option<String>, Box<dyn Error>> {
-    let url = format!("{}/{}/PKGBUILD", GITHUB_AUR_MIRROR_RAW_BASE, pkg);
-    let resp = get(&url)?;
-    if !resp.status().is_success() {
-        // Not found or HTTP error
-        return Ok(None);
-    }
-    let body = resp.text()?;
-    Ok(Some(body))
-}
-
-// Parse pkgver and pkgrel from PKGBUILD text.
-// Returns combined version string like "1.2.3-4" (pkgver-pkgrel), or just "1.2.3" if pkgrel missing.
-fn parse_pkgbuild_version(build: &str) -> Option<String> {
-    // naive but practical parsing:
-    // look for lines like: pkgver=1.2.3 or pkgver='1.2.3' or pkgver="1.2.3"
-    // and pkgrel=4 or pkgrel='4'
-    let mut pkgver: Option<String> = None;
-    let mut pkgrel: Option<String> = None;
-
-    for line in build.lines() {
-        let l = line.trim();
-        // ignore comments
-        if l.starts_with('#') {
-            continue;
-        }
-        if l.starts_with("pkgver") && l.contains('=') {
-            if let Some(idx) = l.find('=') {
-                let mut val = l[idx + 1..].trim();
-                // strip quotes
-                if
-                    (val.starts_with('\'') && val.ends_with('\'')) ||
-                    (val.starts_with('"') && val.ends_with('"'))
-                {
-                    val = &val[1..val.len() - 1];
-                }
-                // ignore complex assignments (like pkgver=$(git describe ...))
-                if !val.contains('$') && !val.contains('(') {
-                    pkgver = Some(val.to_string());
-                } else {
-                    // complicated pkgver; bail out (cannot parse reliably)
-                    return None;
-                }
-            }
-        } else if l.starts_with("pkgrel") && l.contains('=') {
-            if let Some(idx) = l.find('=') {
-                let mut val = l[idx + 1..].trim();
-                if
-                    (val.starts_with('\'') && val.ends_with('\'')) ||
-                    (val.starts_with('"') && val.ends_with('"'))
-                {
-                    val = &val[1..val.len() - 1];
-                }
-                if !val.contains('$') && !val.contains('(') {
-                    pkgrel = Some(val.to_string());
-                } else {
-                    // complicated pkgrel; bail out
-                    return None;
-                }
-            }
-        }
-        // stop early if both found
-        if pkgver.is_some() && pkgrel.is_some() {
-            break;
-        }
-    }
-
-    match (pkgver, pkgrel) {
-        (Some(v), Some(r)) => Some(format!("{}-{}", v, r)),
-        (Some(v), None) => Some(v),
-        _ => None,
-    }
-}
-
-// --- helper to get installed AUR packages and their installed versions ---
-// returns Vec<(name, version_string)>
-fn get_installed_aur() -> Result<Vec<(String, String)>, Box<dyn Error>> {
-    let output = Shell::new("pacman").arg("-Qm").output()?;
-    if !output.status.success() {
-        return Err("failed to run 'pacman -Qm'".into());
-    }
-    let aur_pkgs = String::from_utf8_lossy(&output.stdout);
-    let vec = aur_pkgs
-        .lines()
-        .filter_map(|line| {
-            let mut it = line.split_whitespace();
-            match (it.next(), it.next()) {
-                (Some(name), Some(ver)) => Some((name.to_string(), ver.to_string())),
-                _ => None,
-            }
-        })
-        .collect();
-    Ok(vec)
-}
-
-// --- other helpers ---
-fn fetch_github_packages() -> Result<Vec<String>, Box<dyn Error>> {
-    let output = Shell::new("git")
-        .arg("ls-remote")
-        .arg("--heads")
-        .arg("https://github.com/archlinux/aur.git")
-        .output()?;
-
-    if !output.status.success() {
-        return Err(format!("git ls-remote failed with status: {}", output.status).into());
-    }
-
-    let data = String::from_utf8_lossy(&output.stdout);
-    let packages = data
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .map(|s| s.strip_prefix("refs/heads/").unwrap_or(s).to_string())
-        .collect();
-    Ok(packages)
-}
-
-fn github_package_exists(pkg: &str, list: &[String]) -> bool {
-    list.contains(&pkg.to_string())
-}
-
-// Return true for packages that are debug variants and should be ignored
-fn is_debug_package(name: &str) -> bool {
-    let s = name.to_lowercase();
-    s.ends_with("-debug") ||
-        s.ends_with("-dbg") ||
-        s.ends_with("-dbgsym") ||
-        s.ends_with("-debuginfo")
-}
-
-// --- Command implementations ---
+use std::process::Command as Shell;
 
 fn cmd_search(term: &str, use_github: bool) -> Result<(), Box<dyn Error>> {
     if use_github {
         println!("searching github mirror for '{}'", term);
         let branches = fetch_github_packages()?;
-        let mut matches: Vec<&String> = branches
-            .iter()
-            .filter(|b| b.contains(term))
-            .collect();
+        let mut matches: Vec<&String> = branches.iter().filter(|b| b.contains(term)).collect();
         matches.sort();
         println!("\nFound {} packages (github mirror):", matches.len());
         for pkg in matches {
@@ -242,7 +41,11 @@ fn cmd_search(term: &str, use_github: bool) -> Result<(), Box<dyn Error>> {
 }
 
 fn cmd_install(pkgs: &[String], use_github: bool) -> Result<(), Box<dyn Error>> {
-    let github_list = if use_github { Some(fetch_github_packages()?) } else { None };
+    let github_list = if use_github {
+        Some(fetch_github_packages()?)
+    } else {
+        None
+    };
 
     for pkg_name in pkgs {
         if is_debug_package(pkg_name) {
@@ -253,7 +56,10 @@ fn cmd_install(pkgs: &[String], use_github: bool) -> Result<(), Box<dyn Error>> 
 
         if use_github {
             if !github_package_exists(pkg_name, github_list.as_ref().unwrap()) {
-                eprintln!("package '{}' not found on github mirror, skipping", pkg_name);
+                eprintln!(
+                    "package '{}' not found on github mirror, skipping",
+                    pkg_name
+                );
                 continue;
             }
 
@@ -283,7 +89,10 @@ fn cmd_install(pkgs: &[String], use_github: bool) -> Result<(), Box<dyn Error>> 
                 args.push("--rmdeps");
             }
 
-            let status = Shell::new("makepkg").args(&args).current_dir(pkg_name).status()?;
+            let status = Shell::new("makepkg")
+                .args(&args)
+                .current_dir(pkg_name)
+                .status()?;
             let _ = fs::remove_dir_all(pkg_name);
 
             if status.success() {
@@ -300,7 +109,11 @@ fn cmd_install(pkgs: &[String], use_github: bool) -> Result<(), Box<dyn Error>> 
                 }
             };
 
-            println!("\nInstalling: {} {}", pkg.name, pkg.version.as_deref().unwrap_or(""));
+            println!(
+                "\nInstalling: {} {}",
+                pkg.name,
+                pkg.version.as_deref().unwrap_or("")
+            );
             if !prompt_yes("Proceed?") {
                 println!("Skipping {}", pkg.name);
                 continue;
@@ -319,7 +132,10 @@ fn cmd_install(pkgs: &[String], use_github: bool) -> Result<(), Box<dyn Error>> 
                 args.push("--rmdeps");
             }
 
-            let status = Shell::new("makepkg").args(&args).current_dir(&pkg.name).status()?;
+            let status = Shell::new("makepkg")
+                .args(&args)
+                .current_dir(&pkg.name)
+                .status()?;
             let _ = fs::remove_dir_all(&pkg.name);
 
             if status.success() {
@@ -363,17 +179,22 @@ fn cmd_update(use_github: bool, bypass: &bool) -> Result<(), Box<dyn Error>> {
                         continue;
                     } else {
                         // Could not parse PKGBUILD (dynamic pkgver). Fall back to AUR RPC if possible.
-                        eprintln!("Could not parse PKGBUILD version for {}; falling back to AUR RPC", name);
+                        eprintln!(
+                            "Could not parse PKGBUILD version for {}; falling back to AUR RPC",
+                            name
+                        );
                     }
                 }
                 Ok(None) => {
-                    eprintln!("No PKGBUILD found for {} on GitHub mirror; falling back to AUR RPC", name);
+                    eprintln!(
+                        "No PKGBUILD found for {} on GitHub mirror; falling back to AUR RPC",
+                        name
+                    );
                 }
                 Err(e) => {
                     eprintln!(
                         "Error fetching PKGBUILD for {}: {}; falling back to AUR RPC",
-                        name,
-                        e
+                        name, e
                     );
                 }
             }
@@ -439,7 +260,10 @@ fn cmd_info(pkg_name: &str, use_github: bool) -> Result<(), Box<dyn Error>> {
     let pkg = fetch_info(pkg_name)?;
     println!("\nPackage: {}", pkg.name);
     println!("Version: {}", pkg.version.as_deref().unwrap_or("Unknown"));
-    println!("Maintainer: {}", pkg.maintainer.as_deref().unwrap_or("None"));
+    println!(
+        "Maintainer: {}",
+        pkg.maintainer.as_deref().unwrap_or("None")
+    );
     println!("Popularity: {:.2}", pkg.popularity.unwrap_or(0.0));
     if !pkg.description.as_ref().map_or(true, |s| s.is_empty()) {
         println!("\nDescription:\n  {}", pkg.description.unwrap());
@@ -484,7 +308,11 @@ fn cmd_uninstall(pkgs: &[String], bypass: &bool) -> Result<(), Box<dyn Error>> {
             println!("Skipping {}", pkg);
             continue;
         }
-        let status = Shell::new("sudo").arg("pacman").arg("-Rns").arg(pkg).status()?;
+        let status = Shell::new("sudo")
+            .arg("pacman")
+            .arg("-Rns")
+            .arg(pkg)
+            .status()?;
         if status.success() {
             println!("Successfully removed {}", pkg);
         } else {
@@ -494,75 +322,8 @@ fn cmd_uninstall(pkgs: &[String], bypass: &bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn check_root(bypass: &bool) {
-    // Check is user is root         Check if a bypass flag was provided
-    if Uid::effective().is_root() && !*bypass {
-        println!(
-            "Running this program with root privileges is not supported. Use --bypass-sudo to use bypass this."
-        );
-        exit(1);
-    }
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
-    let matches = Command::new("raur")
-        .version("1.2")
-        .about("Simple AUR Helper")
-        .arg(
-            Arg::new("github")
-                .long("github")
-                .help("Use GitHub mirror instead of AUR RPC (global flag)")
-                .global(true)
-                .action(ArgAction::SetTrue)
-        )
-        .arg(
-            Arg::new("meow")
-                .long("meow")
-                .help("meow (necessary feature)")
-                .global(true)
-                .action(ArgAction::SetTrue)
-        )
-        .arg(
-            Arg::new("bypass-sudo")
-                .long("bypass-sudo")
-                .help("Bypass root verification (not recommended)")
-                .global(true)
-                .action(ArgAction::SetTrue)
-        )
-        .subcommand_required(false)
-        .subcommand(
-            Command::new("search")
-                .about("Search AUR packages")
-                .arg(Arg::new("query").required(true))
-        )
-        .subcommand(
-            Command::new("install")
-                .about("Install AUR packages")
-                .arg(
-                    Arg::new("packages")
-                        .required(true)
-                        .num_args(1..)
-                )
-                .alias("i")
-        )
-        .subcommand(Command::new("update").about("Update installed AUR packages").alias("u"))
-        .subcommand(
-            Command::new("info")
-                .about("Show package information")
-                .arg(Arg::new("package").required(true))
-        )
-        .subcommand(Command::new("clean").about("Clean build directories"))
-        .subcommand(
-            Command::new("uninstall")
-                .about("Uninstall AUR packages")
-                .arg(
-                    Arg::new("packages")
-                        .required(true)
-                        .num_args(1..)
-                )
-                .alias("r")
-        )
-        .get_matches();
+    let matches = cli::build_cli().get_matches();
 
     if matches.get_flag("meow") {
         println!("meow (necessary feature)");
@@ -580,8 +341,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let bypass = matches.get_flag("bypass-sudo");
 
     match matches.subcommand() {
-        Some(("search", sub_m)) =>
-            cmd_search(sub_m.get_one::<String>("query").unwrap(), use_github)?,
+        Some(("search", sub_m)) => {
+            cmd_search(sub_m.get_one::<String>("query").unwrap(), use_github)?
+        }
         Some(("install", sub_m)) => {
             check_root(&bypass);
 

@@ -1,7 +1,15 @@
 [package]
 name = "raur"
-version = "0.1.0"
+version = "1.2.0"
 edition = "2024"
+
+[lib]
+name = "raur_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "raur"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
