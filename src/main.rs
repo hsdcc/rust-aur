@@ -4,22 +4,28 @@ mod fetching;
 mod github;
 mod helpers;
 
-use aur_rpc::{fetch_info, fetch_search};
-use fetching::{get_installed_aur, is_debug_package};
+use aur_rpc::{ fetch_info, fetch_search };
+use fetching::{ get_installed_aur, is_debug_package };
 use github::{
-    fetch_github_packages, fetch_pkgbuild_from_github, github_package_exists,
+    fetch_github_packages,
+    fetch_pkgbuild_from_github,
+    github_package_exists,
     parse_pkgbuild_version,
+    PkgbuildState
 };
-use helpers::{check_root, prompt_yes};
+use helpers::{ check_root, prompt_yes };
 use std::error::Error;
-use std::fs;
+use std::{ fs };
 use std::process::Command as Shell;
 
 fn cmd_search(term: &str, use_github: bool) -> Result<(), Box<dyn Error>> {
     if use_github {
         println!("searching github mirror for '{}'", term);
         let branches = fetch_github_packages()?;
-        let mut matches: Vec<&String> = branches.iter().filter(|b| b.contains(term)).collect();
+        let mut matches: Vec<&String> = branches
+            .iter()
+            .filter(|b| b.contains(term))
+            .collect();
         matches.sort();
         println!("\nFound {} packages (github mirror):", matches.len());
         for pkg in matches {
@@ -41,11 +47,7 @@ fn cmd_search(term: &str, use_github: bool) -> Result<(), Box<dyn Error>> {
 }
 
 fn cmd_install(pkgs: &[String], use_github: bool) -> Result<(), Box<dyn Error>> {
-    let github_list = if use_github {
-        Some(fetch_github_packages()?)
-    } else {
-        None
-    };
+    let github_list = if use_github { Some(fetch_github_packages()?) } else { None };
 
     for pkg_name in pkgs {
         if is_debug_package(pkg_name) {
@@ -56,10 +58,7 @@ fn cmd_install(pkgs: &[String], use_github: bool) -> Result<(), Box<dyn Error>> 
 
         if use_github {
             if !github_package_exists(pkg_name, github_list.as_ref().unwrap()) {
-                eprintln!(
-                    "package '{}' not found on github mirror, skipping",
-                    pkg_name
-                );
+                eprintln!("package '{}' not found on github mirror, skipping", pkg_name);
                 continue;
             }
 
@@ -89,10 +88,7 @@ fn cmd_install(pkgs: &[String], use_github: bool) -> Result<(), Box<dyn Error>> 
                 args.push("--rmdeps");
             }
 
-            let status = Shell::new("makepkg")
-                .args(&args)
-                .current_dir(pkg_name)
-                .status()?;
+            let status = Shell::new("makepkg").args(&args).current_dir(pkg_name).status()?;
             let _ = fs::remove_dir_all(pkg_name);
 
             if status.success() {
@@ -109,11 +105,7 @@ fn cmd_install(pkgs: &[String], use_github: bool) -> Result<(), Box<dyn Error>> 
                 }
             };
 
-            println!(
-                "\nInstalling: {} {}",
-                pkg.name,
-                pkg.version.as_deref().unwrap_or("")
-            );
+            println!("\nInstalling: {} {}", pkg.name, pkg.version.as_deref().unwrap_or(""));
             if !prompt_yes("Proceed?") {
                 println!("Skipping {}", pkg.name);
                 continue;
@@ -132,10 +124,7 @@ fn cmd_install(pkgs: &[String], use_github: bool) -> Result<(), Box<dyn Error>> 
                 args.push("--rmdeps");
             }
 
-            let status = Shell::new("makepkg")
-                .args(&args)
-                .current_dir(&pkg.name)
-                .status()?;
+            let status = Shell::new("makepkg").args(&args).current_dir(&pkg.name).status()?;
             let _ = fs::remove_dir_all(&pkg.name);
 
             if status.success() {
@@ -171,7 +160,7 @@ fn cmd_update(use_github: bool, bypass: &bool) -> Result<(), Box<dyn Error>> {
         if use_github {
             // try to fetch PKGBUILD quickly via raw GitHub URL and parse pkgver/pkgrel
             match fetch_pkgbuild_from_github(&name) {
-                Ok(Some(pkgb)) => {
+                Ok(PkgbuildState::Result(pkgb)) => {
                     if let Some(remote_ver) = parse_pkgbuild_version(&pkgb) {
                         if remote_ver != installed_ver {
                             to_update.push(name.clone());
@@ -179,22 +168,22 @@ fn cmd_update(use_github: bool, bypass: &bool) -> Result<(), Box<dyn Error>> {
                         continue;
                     } else {
                         // Could not parse PKGBUILD (dynamic pkgver). Fall back to AUR RPC if possible.
-                        eprintln!(
-                            "Could not parse PKGBUILD version for {}; falling back to AUR RPC",
-                            name
-                        );
+                        eprintln!("Could not parse PKGBUILD version for {}; falling back to AUR RPC", name);
                     }
                 }
-                Ok(None) => {
-                    eprintln!(
-                        "No PKGBUILD found for {} on GitHub mirror; falling back to AUR RPC",
-                        name
+                Ok(PkgbuildState::NotFound) => {
+                    return Err(format!("package '{}' not found on github mirror", name).into());
+                }
+                Ok(PkgbuildState::OtherError) => {
+                    return Err(
+                        format!("package '{}' returned non-200 return code when fetching", name).into()
                     );
                 }
                 Err(e) => {
                     eprintln!(
                         "Error fetching PKGBUILD for {}: {}; falling back to AUR RPC",
-                        name, e
+                        name,
+                        e
                     );
                 }
             }
@@ -239,7 +228,7 @@ fn cmd_update(use_github: bool, bypass: &bool) -> Result<(), Box<dyn Error>> {
 fn cmd_info(pkg_name: &str, use_github: bool) -> Result<(), Box<dyn Error>> {
     if use_github {
         match fetch_pkgbuild_from_github(pkg_name)? {
-            Some(pkgb) => {
+            PkgbuildState::Result(pkgb) => {
                 if let Some(ver) = parse_pkgbuild_version(&pkgb) {
                     println!("\nPackage: {} (from github mirror)", pkg_name);
                     println!("Version (from PKGBUILD): {}", ver);
@@ -252,18 +241,20 @@ fn cmd_info(pkg_name: &str, use_github: bool) -> Result<(), Box<dyn Error>> {
                     println!("PKGBUILD found but version could not be parsed (dynamic/complex).");
                 }
             }
-            None => {
+            PkgbuildState::NotFound => {
                 return Err(format!("package '{}' not found on github mirror", pkg_name).into());
+            }
+            PkgbuildState::OtherError => {
+                return Err(
+                    format!("package '{}' returned non-200 return code when fetching", pkg_name).into()
+                );
             }
         }
     }
     let pkg = fetch_info(pkg_name)?;
     println!("\nPackage: {}", pkg.name);
     println!("Version: {}", pkg.version.as_deref().unwrap_or("Unknown"));
-    println!(
-        "Maintainer: {}",
-        pkg.maintainer.as_deref().unwrap_or("None")
-    );
+    println!("Maintainer: {}", pkg.maintainer.as_deref().unwrap_or("None"));
     println!("Popularity: {:.2}", pkg.popularity.unwrap_or(0.0));
     if !pkg.description.as_ref().map_or(true, |s| s.is_empty()) {
         println!("\nDescription:\n  {}", pkg.description.unwrap());
@@ -308,11 +299,7 @@ fn cmd_uninstall(pkgs: &[String], bypass: &bool) -> Result<(), Box<dyn Error>> {
             println!("Skipping {}", pkg);
             continue;
         }
-        let status = Shell::new("sudo")
-            .arg("pacman")
-            .arg("-Rns")
-            .arg(pkg)
-            .status()?;
+        let status = Shell::new("sudo").arg("pacman").arg("-Rns").arg(pkg).status()?;
         if status.success() {
             println!("Successfully removed {}", pkg);
         } else {
@@ -342,7 +329,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match matches.subcommand() {
         Some(("search", sub_m)) => {
-            cmd_search(sub_m.get_one::<String>("query").unwrap(), use_github)?
+            cmd_search(sub_m.get_one::<String>("query").unwrap(), use_github)?;
         }
         Some(("install", sub_m)) => {
             check_root(&bypass);
