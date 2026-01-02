@@ -1,19 +1,28 @@
 use raur_lib::GITHUB_AUR_MIRROR_RAW_BASE;
+use reqwest::StatusCode;
 use reqwest::blocking::get;
 use std::error::Error;
 use std::process::Command as Shell;
 
+pub enum PkgbuildState {
+    Result(String),
+    NotFound,
+    OtherError,
+}
+
 // Fetch PKGBUILD from the GitHub aur mirror branch for package `pkg`
 // (raw URL: https://raw.githubusercontent.com/archlinux/aur/<branch>/PKGBUILD)
-pub fn fetch_pkgbuild_from_github(pkg: &str) -> Result<Option<String>, Box<dyn Error>> {
+pub fn fetch_pkgbuild_from_github(pkg: &str) -> Result<PkgbuildState, Box<dyn Error>> {
     let url = format!("{}/{}/PKGBUILD", GITHUB_AUR_MIRROR_RAW_BASE, pkg);
     let resp = get(&url)?;
     if !resp.status().is_success() {
-        // Not found or HTTP error
-        return Ok(None);
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(PkgbuildState::NotFound);
+        }
+        return Ok(PkgbuildState::OtherError);
     }
     let body = resp.text()?;
-    Ok(Some(body))
+    Ok(PkgbuildState::Result(body))
 }
 
 // Parse pkgver and pkgrel from PKGBUILD text.
