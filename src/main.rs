@@ -17,6 +17,7 @@ use helpers::{ check_root, prompt_yes };
 use std::error::Error;
 use std::{ fs };
 use std::process::Command as Shell;
+use ansi_term::Style;
 
 fn cmd_search(term: &str, use_github: bool) -> Result<(), Box<dyn Error>> {
     if use_github {
@@ -37,7 +38,7 @@ fn cmd_search(term: &str, use_github: bool) -> Result<(), Box<dyn Error>> {
     let packages = fetch_search(term)?;
     println!("\nFound {} packages:", packages.len());
     for pkg in packages {
-        println!("\n{} {}", pkg.name, pkg.version.as_deref().unwrap_or(""));
+        println!("\n{} {}", Style::new().bold().paint(pkg.name), Style::new().fg(ansi_term::Color::Fixed(8)).paint(pkg.version.as_deref().unwrap_or("")));
         if let Some(desc) = &pkg.description {
             println!("  {}", desc);
         }
